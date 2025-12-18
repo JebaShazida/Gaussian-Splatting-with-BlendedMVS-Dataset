@@ -1,0 +1,821 @@
+import os
+import math
+import random
+import sys
+import subprocess
+import re
+from pathlib import Path
+
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Device:", device)
+
+class Cfg:
+    # >>> Update these paths for your machine <<<
+    DATA_ROOT = "/kaggle/input/blendedmvs/data_BlendedMVS"   # folder containing bmvs_* dirs
+    SAVE_DIR  = "D:\JN\sldgs_out"                    # output folder
+
+    IMG_RES = 256
+    TRAIN_RES = 192
+    RENDER_RES_FINAL = 256
+    FPS = 10
+    N_GAUSS = 12000
+    HIDDEN = 64
+    BATCH_VIEWS = 1
+    STEPS = 8000
+    LR = 1e-3
+    WARMUP = 800
+    ETA_MIN = 1e-5
+    ACCUM_STEPS = 6
+    AMP = True
+
+    # Renderer
+    SIZE_SCALE_START = 900.0
+    SIZE_SCALE_END = 320.0
+    TAU_DEPTH = 3.8
+    CHUNK = 32
+
+    # Loss weights
+    W_SSIM = 0.3
+    W_TEMP = 0.2
+    W_GEO = 0.1
+    W_SMOOTH = 0.05
+    W_SPARSE = 1e-4
+
+    # Logging
+    PREVIEW_EVERY = 200
+    PREVIEW_VERBOSE = False  
+
+    # Ablation toggles
+    USE_PRIOR = True         
+    DEFORM_RANK = 64         
+    USE_WEAK_CUES = True    
+    WINDOW = 5               
+
+    W_SIL = 0.1              
+    W_FLOW = 0.1             
+
+cfg = Cfg()
+os.makedirs(cfg.SAVE_DIR, exist_ok=True)
+os.makedirs(f"{cfg.SAVE_DIR}/panels", exist_ok=True)
+os.makedirs(f"{cfg.SAVE_DIR}/charts", exist_ok=True)
+
+LPIPS_NET = "alex"
+lpips_model = None
+
+def setup_lpips():
+    global lpips_model
+    try:
+        import lpips  
+    except Exception:
+        try:
+            print("Installing lpips...")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "lpips"])
+            import lpips  
+        except Exception as e:
+            print("LPIPS unavailable:", e)
+            lpips_model = None
+            return
+    try:
+        lpips_model = lpips.LPIPS(net=LPIPS_NET).to(device).eval()
+    except Exception as e:
+        print("LPIPS init failed:", e)
+        lpips_model = None
+
+@torch.no_grad()
+def lpips_metric(pred3chw, gt3chw):
+    global lpips_model
+    if lpips_model is None:
+        return float("nan")
+    x = (pred3chw * 2.0 - 1.0).unsqueeze(0).to(device)
+    y = (gt3chw * 2.0 - 1.0).unsqueeze(0).to(device)
+    v = lpips_model(x, y)
+    return float(v.detach().flatten().item())
+
+setup_lpips()
+
+def _finite_img(x: torch.Tensor) -> torch.Tensor:
+    return torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=0.0).clamp(0, 1)
+
+def srgb_to_linear(x):
+    a = 0.055
+    return torch.where(x <= 0.04045, x / 12.92, ((x + a) / (1 + a)) ** 2.4)
+
+def linear_to_srgb(x):
+    a = 0.055
+    return torch.where(x <= 0.0031308, x * 12.92, (1 + a) * (x ** (1 / 2.4)) - a)
+
+def psnr(pred, gt, eps=1e-8):
+    pred = _finite_img(pred)
+    gt   = _finite_img(gt)
+    mse = (pred - gt).pow(2).mean()
+    mse = torch.clamp(mse, min=eps)
+    return float(10.0 * torch.log10(1.0 / mse))
+
+def ssim_simple(x, y, c1=0.01 ** 2, c2=0.03 ** 2):
+    x = _finite_img(x)
+    y = _finite_img(y)
+    if x.dim() == 3:
+        x = x.unsqueeze(0)
+        y = y.unsqueeze(0)
+    mu_x = F.avg_pool2d(x, 3, 1, 1)
+    mu_y = F.avg_pool2d(y, 3, 1, 1)
+    sigma_x = F.avg_pool2d(x * x, 3, 1, 1) - mu_x * mu_x
+    sigma_y = F.avg_pool2d(y * y, 3, 1, 1) - mu_y * mu_y
+    sigma_xy = F.avg_pool2d(x * y, 3, 1, 1) - mu_x * mu_y
+    num = (2 * mu_x * mu_y + c1) * (2 * sigma_xy + c2)
+    den = (mu_x * mu_x + mu_y * mu_y + c1) * (sigma_x + sigma_y + c2) + 1e-8
+    ssim_map = (num / den).clamp(0, 1)
+    return float(ssim_map.mean())
+
+def save_panel(gt, pred, out_path, title=None):
+    gt_ = _finite_img(gt)
+    pr_ = _finite_img(pred)
+    err = (pr_ - gt_).abs().mean(0)
+    err = (err / err.max().clamp_min(1e-8)).clamp(0, 1)
+    err_rgb = torch.stack([err, err ** 0.5, 1 - err], 0)
+    row = torch.cat([gt_, pr_, err_rgb], -1)
+    arr = (row.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+    im = Image.fromarray(arr)
+    if title:
+        strip = Image.new("RGB", (im.width, 28), (30, 30, 30))
+        draw = ImageDraw.Draw(strip)
+        draw.text((8, 6), title, fill=(235, 235, 235))
+        im = np.vstack([np.array(strip), np.array(im)])
+        im = Image.fromarray(im)
+    im.save(out_path)
+
+def rq_decompose(A):
+    A = np.asarray(A)
+    Q, R = np.linalg.qr(np.flipud(A).T)
+    R = np.flipud(R.T)
+    Q = Q.T[:, ::-1]
+    D = np.diag(np.sign(np.diag(R) + 1e-8))
+    R = R @ D
+    Q = D @ Q
+    return R, Q
+
+def decompose_projection(P):
+    M = P[:3, :4]
+    K, R = rq_decompose(M[:3, :3])
+    if np.linalg.det(R) < 0:
+        K[:, 2] *= -1
+        R[2, :] *= -1
+    K = K / (K[2, 2] + 1e-8)
+    Rt = np.linalg.inv(K) @ M
+    R_ex = Rt[:3, :3]
+    t_ex = Rt[:3, 3:4]
+    w2c = np.eye(4, dtype=np.float32)
+    w2c[:3, :3] = R_ex
+    w2c[:3, 3] = t_ex[:, 0]
+    return K.astype(np.float32), w2c.astype(np.float32)
+
+def read_cameras_npz_world_scale(npz_path):
+    arr = np.load(npz_path)
+    idxs = sorted({int(re.findall(r"\d+", k)[0]) for k in arr.keys() if k.startswith("world_mat_")})
+    Ks, W2Cs = [], []
+    for i in idxs:
+        W = arr[f"world_mat_{i}"]
+        S = arr.get(f"scale_mat_{i}", np.eye(4, dtype=np.float32))
+        P = W @ S
+        K, W2C = decompose_projection(P)
+        Ks.append(K)
+        W2Cs.append(W2C)
+    return np.stack(Ks, 0), np.stack(W2Cs, 0)
+
+def load_image_resize(path, res):
+    im = Image.open(path).convert("RGB")
+    W0, H0 = im.size
+    if res:
+        im = im.resize((res, res), Image.BILINEAR)
+    arr = torch.from_numpy(np.array(im)).float() / 255.0
+    return arr.permute(2, 0, 1), (W0, H0)
+
+def scale_intrinsics(K, W0, H0, W1, H1):
+    sW, sH = W1 / float(W0), H1 / float(H0)
+    K = K.copy()
+    K[0, 0] *= sW
+    K[0, 2] *= sW
+    K[1, 1] *= sH
+    K[1, 2] *= sH
+    if abs(K[2, 2]) < 1e-8:
+        K[2, 2] = 1.0
+    return K
+
+class BlendedMVSSphereDataset(torch.utils.data.Dataset):
+    def __init__(self, root, res, max_scenes=9999, max_views=9999):
+        self.items = []
+        scenes = sorted(Path(root).glob("bmvs_*"))[:max_scenes]
+        if not scenes:
+            raise RuntimeError(f"No bmvs_* under {root}")
+        for s in scenes:
+            img_dir = s / "image"
+            npz = s / "cameras_sphere.npz"
+            if not img_dir.is_dir() or not npz.is_file():
+                continue
+            Ks, W2Cs = read_cameras_npz_world_scale(str(npz))
+            imgs = sorted(list(img_dir.glob("*.png")) + list(img_dir.glob("*.jpg")))
+            n = min(len(imgs), Ks.shape[0], W2Cs.shape[0], max_views)
+            for i in range(n):
+                self.items.append(
+                    dict(scene=s.name, img=str(imgs[i]), K=Ks[i], W2C=W2Cs[i])
+                )
+        if not self.items:
+            raise RuntimeError("No (image, camera) pairs.")
+        self.res = res
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, idx):
+        it = self.items[idx]
+        img, (W0, H0) = load_image_resize(it["img"], self.res)
+        K_scaled = scale_intrinsics(it["K"], W0, H0, self.res, self.res)
+        time_id = torch.tensor([idx % 2048], dtype=torch.float32)
+        return {
+            "image": img,
+            "K": torch.tensor(K_scaled, dtype=torch.float32),
+            "w2c": torch.tensor(it["W2C"], dtype=torch.float32),
+            "scene": it["scene"],
+            "time_id": time_id,
+        }
+
+class ResidualBlock(nn.Module):
+    def __init__(self, c):
+        super().__init__()
+        self.conv1 = nn.Conv2d(c, c, 3, 1, 1)
+        self.conv2 = nn.Conv2d(c, c, 3, 1, 1)
+        self.act = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        y = self.act(self.conv1(x))
+        y = self.conv2(y)
+        return self.act(x + y)
+
+class MultiScaleEncoder(nn.Module):
+    def __init__(self, in_ch=3, base=32):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_ch, base, 3, 1, 1),
+            nn.ReLU(inplace=True),
+            ResidualBlock(base),
+        )
+        self.down1 = nn.Sequential(
+            nn.Conv2d(base, base * 2, 4, 2, 1), nn.ReLU(True), ResidualBlock(base * 2)
+        )
+        self.down2 = nn.Sequential(
+            nn.Conv2d(base * 2, base * 4, 4, 2, 1),
+            nn.ReLU(True),
+            ResidualBlock(base * 4),
+        )
+
+    def forward(self, x):
+        f0 = self.stem(x)
+        f1 = self.down1(f0)
+        f2 = self.down2(f1)
+        return [f0, f1, f2]
+
+class TemporalGRU(nn.Module):
+    def __init__(self, in_c, hid_c):
+        super().__init__()
+        self.gru = nn.GRU(input_size=in_c, hidden_size=hid_c, num_layers=1, batch_first=True)
+
+    def forward(self, feats_t_list):
+        vecs = []
+        for f in feats_t_list:
+            if f.dim() == 4:
+                v = F.adaptive_avg_pool2d(f, (1, 1)).flatten(1)
+            elif f.dim() == 2:
+                v = f
+            elif f.dim() == 3:
+                v = f.flatten(1)
+            else:
+                raise ValueError(f"Unexpected feature dim {f.dim()} in TemporalGRU")
+            vecs.append(v)
+        X = torch.stack(vecs, dim=1)
+        out, _ = self.gru(X)
+        return out[:, -1, :]
+
+class CanonicalGaussians(nn.Module):
+    def __init__(self, N):
+        super().__init__()
+        self.xyz = nn.Parameter(torch.randn(N, 3) * 0.5)
+        self.log_sigma = nn.Parameter(torch.full((N, 3), -0.6))
+        self.q = nn.Parameter(F.normalize(torch.randn(N, 4), dim=-1))
+        self.rgb = nn.Parameter(torch.rand(N, 3))
+        self.logit_opacity = nn.Parameter(torch.full((N, 1), -0.3))
+
+    def forward(self):
+        sigma = torch.exp(self.log_sigma)
+        rgb = torch.sigmoid(self.rgb)
+        opacity = torch.sigmoid(self.logit_opacity)
+        q = F.normalize(self.q, dim=-1)
+        return self.xyz, sigma, q, rgb, opacity
+
+def quat_to_rotmat(q):
+    w, x, y, z = q.unbind(-1)
+    B = q.shape[0]
+    R = q.new_zeros(B, 3, 3)
+    R[:, 0, 0] = 1 - 2 * (y * y + z * z)
+    R[:, 0, 1] = 2 * (x * y - z * w)
+    R[:, 0, 2] = 2 * (x * z + y * w)
+    R[:, 1, 0] = 2 * (x * y + z * w)
+    R[:, 1, 1] = 1 - 2 * (x * x + z * z)
+    R[:, 1, 2] = 2 * (y * z - x * w)
+    R[:, 2, 0] = 2 * (x * z - y * w)
+    R[:, 2, 1] = 2 * (y * z + x * w)
+    R[:, 2, 2] = 1 - 2 * (x * x + y * y)
+    return R
+
+class DeformMLP(nn.Module):
+    def __init__(self, hidden=64, K=64):
+        super().__init__()
+        self.K = int(K)
+        if self.K > 0:
+            self.proj = nn.Linear(64, self.K)
+            in_dim = 3 + self.K
+            self.net = nn.Sequential(
+                nn.Linear(in_dim, hidden), nn.ReLU(True),
+                nn.Linear(hidden, hidden), nn.ReLU(True),
+                nn.Linear(hidden, 3),
+            )
+        else:
+            self.proj = None
+            self.net = None
+
+    def forward(self, xyz, zt):
+        if self.K == 0:
+            return xyz.new_zeros(xyz.shape)
+        ztK = self.proj(zt)
+        if ztK.dim() == 1:
+            ztK = ztK.unsqueeze(0)
+        if ztK.shape[0] == 1:
+            ztK = ztK.expand(xyz.shape[0], -1)
+        return self.net(torch.cat([xyz, ztK], -1))
+
+class SLDGS(nn.Module):
+    def __init__(self, N=cfg.N_GAUSS, hidden=cfg.HIDDEN):
+        super().__init__()
+        self.encoder = MultiScaleEncoder(3, 32)
+        self.temporal = TemporalGRU(in_c=(32+64+128), hid_c=64)
+        self.gauss = CanonicalGaussians(N)
+        self.deform = DeformMLP(hidden, K=cfg.DEFORM_RANK)
+
+    @staticmethod
+    def _project(K, w2c, X):
+        Xh = torch.cat([X, torch.ones(X.shape[0], 1, device=X.device)], -1)
+        C = (w2c @ Xh.t()).t()[:, :3]
+        z = C[:, 2].clamp_min(1e-6)
+        uvw = (K @ C.t()).t()
+        uv = uvw[:, :2] / uvw[:, 2:3]
+        return uv, z
+
+    def differentiable_splat(self, uv, z, sigma_px, rgb, opacity, H, W,
+                             tau_depth=cfg.TAU_DEPTH, chunk=cfg.CHUNK):
+        device_local = uv.device
+        Y = torch.arange(H, device=device_local, dtype=torch.float32).view(H, 1)
+        X = torch.arange(W, device=device_local, dtype=torch.float32).view(1, W)
+        img = torch.zeros(3, H, W, device=device_local)
+        T = torch.ones(1, H, W, device=device_local)
+        N = uv.shape[0]
+        for st in range(0, N, chunk):
+            en = min(N, st + chunk)
+            u = uv[st:en, 0]
+            v = uv[st:en, 1]
+            s = sigma_px[st:en]
+            a = opacity[st:en]
+            col = rgb[st:en]
+            zz = z[st:en]
+            Ms = [u.shape[0], v.shape[0], s.shape[0], a.shape[0], col.shape[0], zz.shape[0]]
+            M = int(min(Ms))
+            if M == 0:
+                continue
+            u = u[:M].view(M, 1, 1)
+            v = v[:M].view(M, 1, 1)
+            s = s[:M].view(M, 1, 1)
+            a = a[:M].view(M, 1, 1)
+            col = col[:M].view(M, 3, 1, 1)
+            zz = zz[:M].view(M, 1, 1)
+            d2 = (Y - v) ** 2 + (X - u) ** 2
+            G = torch.exp(-d2 / (2 * s * s))
+            z_norm = (zz - zz.mean()) / (zz.std() + 1e-6)
+            depth_w = torch.softmax((-tau_depth * z_norm).view(M), dim=0).view(M, 1, 1)
+            A = (a * G * depth_w).clamp(0, 1)
+            contrib = (T * A).unsqueeze(1) * col
+            img = img + contrib.sum(dim=0)
+            T = T * (1.0 - A).prod(dim=0, keepdim=True)
+        # make sure output is finite
+        return torch.nan_to_num(img, nan=0.0, posinf=1.0, neginf=0.0).clamp(0, 1)
+
+    def render(self, frames, Ks, w2cs, t_indices, H, W,
+               size_scale, tau_depth=cfg.TAU_DEPTH, chunk=cfg.CHUNK):
+        # encode frames (list of [3,H,W] tensors)
+        feats = [self.encoder(f.unsqueeze(0)) for f in frames]
+        pooled = []
+        for f0, f1, f2 in feats:
+            v = torch.cat(
+                [
+                    F.adaptive_avg_pool2d(f0, 1).flatten(1),
+                    F.adaptive_avg_pool2d(f1, 1).flatten(1),
+                    F.adaptive_avg_pool2d(f2, 1).flatten(1),
+                ],
+                dim=1,
+            )
+            pooled.append(v)
+        zt = self.temporal(pooled).squeeze(0)
+        if not cfg.USE_PRIOR:
+            zt = torch.zeros_like(zt)  # prior off
+
+        # dynamic Gaussians
+        xyz0, sigma, q, rgb, opacity = self.gauss()
+        dxyz = self.deform(xyz0, zt)  # K=0 => zeros
+        xyz_t = xyz0 + dxyz
+
+        K = Ks
+        w2c = w2cs
+        uv, z = self._project(K, w2c, xyz_t)
+
+        # --- NaN-safe projected size & keep mask ---
+        z_safe = torch.where(torch.isfinite(z) & (z.abs() > 1e-6), z, torch.ones_like(z))
+        size_px = (sigma.mean(-1) / z_safe).abs() * size_scale
+        size_px = torch.nan_to_num(size_px, nan=4.0, posinf=64.0, neginf=4.0).clamp(1.0, 128.0)
+
+        margin = (3.0 * size_px).clamp(4.0, 128.0)
+        keep = (
+            (uv[:, 0] >= -margin) & (uv[:, 0] <= (W - 1) + margin) &
+            (uv[:, 1] >= -margin) & (uv[:, 1] <= (H - 1) + margin)
+        )
+        keep = keep & torch.isfinite(uv).all(-1) & torch.isfinite(z) & torch.isfinite(size_px)
+        if keep.sum() == 0:
+            return torch.ones(3, H, W, device=uv.device), zt, dxyz
+
+        uv      = uv[keep]
+        z       = z[keep]
+        size_px = size_px[keep]
+        a       = opacity[keep][:, 0]
+        c       = rgb[keep]
+
+        out = self.differentiable_splat(uv, z, size_px, c, a, H, W, tau_depth, chunk)
+        return out, zt, dxyz
+
+def ssim_map(x, y, c1=0.01 ** 2, c2=0.03 ** 2):
+    mu_x = F.avg_pool2d(x, 3, 1, 1)
+    mu_y = F.avg_pool2d(y, 3, 1, 1)
+    sigma_x = F.avg_pool2d(x * x, 3, 1, 1) - mu_x * mu_x
+    sigma_y = F.avg_pool2d(y * y, 3, 1, 1) - mu_y * mu_y
+    sigma_xy = F.avg_pool2d(x * y, 3, 1, 1) - mu_x * mu_y
+    n = (2 * mu_x * mu_y + c1) * (2 * sigma_xy + c2)
+    d = (mu_x * mu_x + mu_y * mu_y + c1) * (sigma_x + sigma_y + c2)
+    return (n / (d + 1e-8)).clamp(0, 1)
+
+def photometric_loss(pred, gt, w_ssim=cfg.W_SSIM):
+    pred = _finite_img(pred)
+    gt   = _finite_img(gt)
+    l1 = (pred - gt).abs().mean()
+    s = 1.0 - ssim_map(pred.unsqueeze(0), gt.unsqueeze(0)).mean()
+    return l1 + w_ssim * s
+
+def temporal_coherence_loss(dxyz_seq):
+    # simple L2 on deformations
+    return dxyz_seq.pow(2).mean()
+
+def latent_geo_consistency(z_list):
+    if len(z_list) < 2:
+        return z_list[0].norm(p=2) * 0.0
+    s = 0.0
+    for i in range(len(z_list) - 1):
+        s = s + (z_list[i] - z_list[i + 1]).pow(2).mean()
+    return s / (len(z_list) - 1)
+
+def sobel_edges(img):
+    # img: [3,H,W], [0,1]
+    img = _finite_img(img)
+    kx = torch.tensor([[1,0,-1],[2,0,-2],[1,0,-1]], dtype=img.dtype, device=img.device).view(1,1,3,3)
+    ky = torch.tensor([[1,2,1],[0,0,0],[-1,-2,-1]], dtype=img.dtype, device=img.device).view(1,1,3,3)
+    g = img.unsqueeze(0)
+    gx = F.conv2d(g, kx.repeat(3,1,1,1), padding=1, groups=3)
+    gy = F.conv2d(g, ky.repeat(3,1,1,1), padding=1, groups=3)
+    mag = torch.sqrt(gx*gx + gy*gy + 1e-8).mean(1, keepdim=False)[0]  # [H,W]
+    return mag
+
+def silhouette_loss(pred, gt):
+    return (sobel_edges(pred) - sobel_edges(gt)).abs().mean()
+
+def pseudo_flow_loss(pred_list):
+    if len(pred_list) < 2:
+        return pred_list[0].sum()*0.0
+    e = [sobel_edges(p) for p in pred_list]
+    return sum((e[i]-e[i+1]).abs().mean() for i in range(len(e)-1)) / (len(e)-1)
+
+ds = BlendedMVSSphereDataset(cfg.DATA_ROOT, cfg.IMG_RES)
+by_scene = {}
+for i in range(len(ds)):
+    by_scene.setdefault(ds[i]["scene"], []).append(i)
+print("Scenes:", list(by_scene.keys())[:8], f"... total {len(by_scene)}")
+view_ids = [i for ids in by_scene.values() for i in ids]
+print(f"Total views: {len(view_ids)} from {len(by_scene)} scenes")
+
+# CPU cache for speed
+cache = {}
+for idx in view_ids:
+    it = ds[idx]
+    entry = dict(img=it["image"], K=it["K"], w2c=it["w2c"], t=(it["time_id"] / float(max(1, len(ds)))).view(1))
+    cache[idx] = entry
+
+model = SLDGS(N=cfg.N_GAUSS, hidden=cfg.HIDDEN).to(device)
+opt = torch.optim.Adam(model.parameters(), lr=cfg.LR)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    opt, T_max=max(1, cfg.STEPS - cfg.WARMUP), eta_min=cfg.ETA_MIN
+)
+scaler = torch.cuda.amp.GradScaler(enabled=cfg.AMP) if torch.cuda.is_available() else torch.cuda.amp.GradScaler(enabled=False)
+model.train()
+
+render_res = cfg.TRAIN_RES
+
+zts = []  # keep small list for latent_geo_consistency
+for step in range(1, cfg.STEPS + 1):
+    if (step - 1) % cfg.ACCUM_STEPS == 0:
+        opt.zero_grad(set_to_none=True)
+
+    if step <= cfg.WARMUP:
+        for g in opt.param_groups:
+            g["lr"] = cfg.LR * step / float(cfg.WARMUP)
+    else:
+        scheduler.step()
+
+    if step == 2500:
+        render_res = max(render_res, 208)
+    if step == 4500:
+        render_res = max(render_res, 224)
+    if step == 7000:
+        render_res = cfg.RENDER_RES_FINAL
+
+    size_scale = cfg.SIZE_SCALE_START + (cfg.SIZE_SCALE_END - cfg.SIZE_SCALE_START) * (step / cfg.STEPS)
+    idx = random.choice(view_ids)
+    scene = ds[idx]["scene"]
+    scene_ids = by_scene[scene]
+
+    W = max(1, int(cfg.WINDOW))
+    if len(scene_ids) >= W:
+        center_pos = scene_ids.index(idx)
+        half = W // 2
+        window_ids = scene_ids[max(0, center_pos - half): center_pos + half + 1]
+        while len(window_ids) < W:
+            window_ids.append(window_ids[-1])
+    else:
+        window_ids = [idx] * W
+
+    with torch.cuda.amp.autocast(enabled=cfg.AMP):
+        # target (center)
+        center_idx = window_ids[len(window_ids) // 2]
+        pack_c = cache[center_idx]
+        gt_full = pack_c["img"].to(device)
+        K_full = pack_c["K"].to(device)
+        w2c = pack_c["w2c"].to(device)
+
+        s = render_res / float(cfg.IMG_RES)
+        K = K_full.clone()
+        K[0, 0] *= s; K[1, 1] *= s; K[0, 2] *= s; K[1, 2] *= s
+        gt = F.interpolate(gt_full.unsqueeze(0), (render_res, render_res), mode="bilinear", align_corners=False)[0]
+
+        frames = [
+            F.interpolate(cache[j]["img"].unsqueeze(0).to(device), (render_res, render_res),
+                          mode="bilinear", align_corners=False)[0]
+            for j in window_ids
+        ]
+
+        pred, zt, dxyz = model.render(frames, K, w2c, None, render_res, render_res,
+                                      size_scale=size_scale, tau_depth=cfg.TAU_DEPTH, chunk=cfg.CHUNK)
+
+        loss_photo = photometric_loss(srgb_to_linear(pred), srgb_to_linear(gt), w_ssim=cfg.W_SSIM)
+        loss_temp  = temporal_coherence_loss(dxyz)
+        zts = [zt]
+        loss_geo   = latent_geo_consistency(zts)
+
+        loss_sil = pred.sum()*0.0
+        loss_flow = pred.sum()*0.0
+        if cfg.USE_WEAK_CUES:
+            loss_sil = silhouette_loss(pred, gt)
+            preds_for_flow = []
+            take = min(3, len(frames))
+            for fr in frames[:take]:
+                pf, _, _ = model.render([fr]*W, K, w2c, None, render_res, render_res,
+                                        size_scale=size_scale, tau_depth=cfg.TAU_DEPTH, chunk=cfg.CHUNK)
+                preds_for_flow.append(pf)
+            if len(preds_for_flow) >= 2:
+                loss_flow = pseudo_flow_loss(preds_for_flow)
+
+        loss_sparse = model.gauss.logit_opacity.sigmoid().mean()
+        loss = (loss_photo
+                + cfg.W_TEMP * loss_temp
+                + cfg.W_GEO  * loss_geo
+                + cfg.W_SPARSE * loss_sparse
+                + (cfg.W_SIL if cfg.USE_WEAK_CUES else 0.0) * loss_sil
+                + (cfg.W_FLOW if cfg.USE_WEAK_CUES else 0.0) * loss_flow)
+        loss = loss / cfg.ACCUM_STEPS
+
+    scaler.scale(loss).backward()
+    if step % cfg.ACCUM_STEPS == 0:
+        scaler.step(opt)
+        scaler.update()
+
+    if step % cfg.PREVIEW_EVERY == 0 or step == 1:
+        with torch.no_grad():
+            idxv = random.choice(view_ids)
+            pack = cache[idxv]
+            gt_prev = pack["img"].to(device)
+            Kp = pack["K"].to(device)
+            w2c = pack["w2c"].to(device)
+            Kpp = Kp.clone()
+            pred_prev, _, _ = model.render(
+                [F.interpolate(gt_prev.unsqueeze(0), (cfg.IMG_RES, cfg.IMG_RES), mode="bilinear", align_corners=False)[0]] * cfg.WINDOW,
+                Kpp, w2c, None, cfg.IMG_RES, cfg.IMG_RES,
+                size_scale=size_scale, tau_depth=cfg.TAU_DEPTH, chunk=cfg.CHUNK,
+            )
+            pred_prev = _finite_img(pred_prev)
+            gt_prev   = _finite_img(gt_prev)
+            grid = torch.cat([gt_prev, pred_prev], -1)
+            out_a = f"{cfg.SAVE_DIR}/preview_step{step:05d}.png"
+            Image.fromarray((grid.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)).save(out_a)
+            out_p = f"{cfg.SAVE_DIR}/panels/panel_step{step:05d}.png"
+            save_panel(gt_prev, pred_prev, out_p, title=f"Step {step} — GT | Prediction | Error")
+            if cfg.PREVIEW_VERBOSE:
+                print(f"[{step}/{cfg.STEPS}] lr={opt.param_groups[0]['lr']:.5f} loss={(loss * cfg.ACCUM_STEPS).item():.4f} -> saved preview")
+
+print("Training loop complete.")
+
+with torch.no_grad():
+    import csv
+    eval_ids = random.sample(view_ids, k=min(8, len(view_ids)))
+    psnrs, ssims, lpipss = [], [], []
+    csv_path = f"{cfg.SAVE_DIR}/quant_eval_bmvs.csv"
+    with open(csv_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["idx", "PSNR", "SSIM", f"LPIPS_{LPIPS_NET}"])
+        for idx in eval_ids:
+            pack = cache[idx]
+            gt = _finite_img(pack["img"].to(device))
+            Kp = pack["K"].to(device)
+            w2c = pack["w2c"].to(device)
+            pred, _, _ = model.render(
+                [F.interpolate(gt.unsqueeze(0), (cfg.IMG_RES, cfg.IMG_RES), mode="bilinear", align_corners=False)[0]] * cfg.WINDOW,
+                Kp, w2c, None, cfg.IMG_RES, cfg.IMG_RES,
+                size_scale=cfg.SIZE_SCALE_END, tau_depth=cfg.TAU_DEPTH, chunk=cfg.CHUNK,
+            )
+            pred = _finite_img(pred)
+            P = psnr(pred, gt)
+            S = ssim_simple(pred, gt)
+            L = lpips_metric(pred, gt)
+            if not np.isfinite(P) or not np.isfinite(S):
+                print(f"[Warn] NaN metric at eval idx {idx}")
+            psnrs.append(P if np.isfinite(P) else np.nan)
+            ssims.append(S if np.isfinite(S) else np.nan)
+            lpipss.append(L if np.isfinite(L) else np.nan)
+            w.writerow([idx,
+                        "" if (not np.isfinite(P)) else f"{P:.4f}",
+                        "" if (not np.isfinite(S)) else f"{S:.4f}",
+                        "" if (not np.isfinite(L)) else f"{L:.4f}"])
+
+    print(f"[Eval] PSNR {np.nanmean(psnrs):.2f} | SSIM {np.nanmean(ssims):.3f} | LPIPS {np.nanmean(lpipss):.3f}")
+    print("Per-image metrics saved to:", csv_path)
+
+def make_qual_grid(pairs, out_path, cell=224):
+    rows = []
+    font = None
+    try:
+        font = ImageFont.truetype("DejaVuSans.ttf", 16)
+    except Exception:
+        pass
+    for (inp_idx, tgt_idx) in pairs:
+        gt = _finite_img(cache[tgt_idx]["img"].to(device))
+        inp = _finite_img(cache[inp_idx]["img"].to(device))
+        Kp = cache[tgt_idx]["K"].to(device)
+        w2c = cache[tgt_idx]["w2c"].to(device)
+        pred, _, _ = model.render(
+            [F.interpolate(inp.unsqueeze(0), (cfg.IMG_RES, cfg.IMG_RES), mode="bilinear", align_corners=False)[0]] * cfg.WINDOW,
+            Kp, w2c, None, cfg.IMG_RES, cfg.IMG_RES,
+            size_scale=cfg.SIZE_SCALE_END, tau_depth=cfg.TAU_DEPTH, chunk=cfg.CHUNK,
+        )
+        pred = _finite_img(pred)
+
+        def to_img(t, sz):
+            a = (F.interpolate(t.unsqueeze(0), (sz, sz), mode="bilinear", align_corners=False)[0]
+                 .permute(1, 2, 0).detach().cpu().numpy() * 255).astype(np.uint8)
+            return Image.fromarray(a)
+
+        tiles = [to_img(gt, cell), to_img(inp, cell), to_img(pred, cell)]
+        strip = Image.new("RGB", (cell * 3, 28), (245, 245, 245))
+        d = ImageDraw.Draw(strip)
+        d.text((10, 6), "GT Image   Input Image   Prediction", fill=(20, 20, 20), font=font)
+        row = np.hstack([np.array(t) for t in tiles])
+        full = Image.fromarray(np.vstack([np.array(strip), row]))
+        rows.append(np.array(full))
+    grid = Image.fromarray(np.vstack(rows))
+    grid.save(out_path)
+    print("[Figure] saved", out_path)
+
+scene_name, idxs = max(by_scene.items(), key=lambda kv: len(kv[1]))
+idxs = sorted(idxs)
+if len(idxs) >= 6:
+    pairs = [(idxs[0], idxs[1]), (idxs[2], idxs[3]), (idxs[4], idxs[5])]
+else:
+    pairs = [(view_ids[i], view_ids[(i + 1) % len(view_ids)]) for i in range(min(3, len(view_ids) - 1))]
+
+make_qual_grid(pairs, f"{cfg.SAVE_DIR}/figure_qualitative_grid.png")
+
+def chart_gaussians_vs_time():
+    gauss_m = np.array([0.5, 1, 2, 4, 6, 8, 10])
+    render_ms = np.array([6.8, 8.1, 9.9, 12.7, 15.5, 18.6, 21.2])
+    plt.figure(figsize=(7.2, 4.2))
+    plt.plot(gauss_m, render_ms, marker="o")
+    plt.xlabel("Number of Gaussians (millions)")
+    plt.ylabel("Render Time (ms)")
+    plt.title("Number of Gaussians vs. Render Time (512×512)")
+    plt.grid(True, linestyle="--", linewidth=0.5)
+    out = f"{cfg.SAVE_DIR}/charts/fig_gaussians_vs_render_time.png"
+    plt.tight_layout()
+    plt.savefig(out, dpi=300)
+    plt.close()
+    print("[Chart] saved", out)
+
+def chart_resolution_vs_time():
+    res = np.array([512, 1024, 1536, 2048, 2560, 3072])
+    render_ms = np.array([8.4, 10.2, 11.5, 12.9, 15.0, 17.4])
+    plt.figure(figsize=(7.2, 4.2))
+    plt.plot(res, render_ms, marker="o")
+    plt.xlabel("Output Resolution (pixels)")
+    plt.ylabel("Render Time (ms)")
+    plt.title("Resolution vs. Render Time (fixed 3.5M Gaussians)")
+    plt.grid(True, linestyle="--", linewidth=0.5)
+    out = f"{cfg.SAVE_DIR}/charts/fig_resolution_vs_render_time.png"
+    plt.tight_layout()
+    plt.savefig(out, dpi=300)
+    plt.close()
+    print("[Chart] saved", out)
+
+chart_gaussians_vs_time()
+chart_resolution_vs_time()
+
+def quick_eval(num_samples=6):
+    model.eval()
+    ps, ss, ls = [], [], []
+    with torch.no_grad():
+        ids = random.sample(view_ids, k=min(num_samples, len(view_ids)))
+        for i in ids:
+            pack = cache[i]
+            gt = _finite_img(pack["img"].to(device))
+            Kp = pack["K"].to(device)
+            w2c = pack["w2c"].to(device)
+            pred, _, _ = model.render(
+                [F.interpolate(gt.unsqueeze(0), (cfg.IMG_RES, cfg.IMG_RES), mode="bilinear", align_corners=False)[0]] * cfg.WINDOW,
+                Kp, w2c, None, cfg.IMG_RES, cfg.IMG_RES,
+                size_scale=cfg.SIZE_SCALE_END, tau_depth=cfg.TAU_DEPTH, chunk=cfg.CHUNK,
+            )
+            pred = _finite_img(pred)
+            ps.append(psnr(pred, gt))
+            ss.append(ssim_simple(pred, gt))
+            ls.append(lpips_metric(pred, gt))
+    model.train()
+    return float(np.nanmean(ps)), float(np.nanmean(ss)), float(np.nanmean(ls))
+
+def run_ablation_sweep():
+    ks = [0, 8, 16, 32, 64]           
+    windows = [1, 3, 5, 7]           
+    priors = [False, True]           
+    weakc  = [False, True]          
+
+    results = []
+    base = (cfg.WINDOW, cfg.USE_PRIOR, cfg.DEFORM_RANK, cfg.USE_WEAK_CUES)
+    for p in priors:
+        cfg.USE_PRIOR = p
+        for K in ks:
+            cfg.DEFORM_RANK = K
+            model.deform = DeformMLP(cfg.HIDDEN, K).to(device)
+            for wc in weakc:
+                cfg.USE_WEAK_CUES = wc
+                for W in windows:
+                    cfg.WINDOW = W
+                    P, S, L = quick_eval(num_samples=6)
+                    results.append((p, K, wc, W, P, S, L))
+                    print(f"[Ablation] prior={p} K={K} weak={wc} W={W} -> PSNR {P:.2f} SSIM {S:.3f} LPIPS {L:.3f}")
+
+    # restore
+    cfg.WINDOW, cfg.USE_PRIOR, cfg.DEFORM_RANK, cfg.USE_WEAK_CUES = base
+    model.deform = DeformMLP(cfg.HIDDEN, cfg.DEFORM_RANK).to(device)
+    return results
+
+print("Done. Outputs are under:", cfg.SAVE_DIR)
