@@ -1,0 +1,2 @@
+# Gaussian-Splatting-with-BlendedMVS-Dataset
+PyTorch SLDGS: temporally conditioned 3D Gaussian splatting for BlendedMVS. Multi-scale CNN + GRU predicts dynamic Gaussian deformation; differentiable splat renderer trains with photometric (L1+SSIM), temporal/geo losses and optional weak cues. Saves previews, PSNR/SSIM/LPIPS metrics and ablations.
