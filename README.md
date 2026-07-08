@@ -1,6 +1,6 @@
 PyTorch GS: temporally conditioned 3D Gaussian splatting for BlendedMVS. Multi-scale CNN + GRU predicts dynamic Gaussian deformation; differentiable splat renderer trains with photometric (L1+SSIM), temporal/geo losses and optional weak cues. Saves previews, PSNR/SSIM/LPIPS metrics and ablations.
 
-BlendedMVS Dataset
+BlendedMVS Dataset Sample
 <img width="768" height="576" alt="Image" src="https://github.com/user-attachments/assets/1ed254cc-83d7-4a6b-9edd-5cc433c3a8f6" />
 <img width="768" height="576" alt="Image" src="https://github.com/user-attachments/assets/7c8608af-0db7-46ac-a84b-83188c7649f8" />
 <img width="768" height="576" alt="Image" src="https://github.com/user-attachments/assets/64cab36a-3344-4949-ab59-64abad614825" />
